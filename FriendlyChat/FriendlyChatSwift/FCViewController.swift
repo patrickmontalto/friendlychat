@@ -55,8 +55,6 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     
     override func viewDidLoad() {
         configureAuth()
-        // TODO: Handle what users see when view loads
-        
     }
     
     override func viewWillDisappear(_ animated: Bool) {
@@ -122,11 +120,36 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     // MARK: Remote Config
     
     func configureRemoteConfig() {
-        // TODO: configure remote configuration settings
+        // create remote config setting to enable developer mode
+        let remoteConfigSettings = FIRRemoteConfigSettings(developerModeEnabled: true)
+        remoteConfig = FIRRemoteConfig.remoteConfig()
+        remoteConfig.configSettings = remoteConfigSettings!
     }
     
     func fetchConfig() {
-        // TODO: update to the current coniguratation
+        // Time that goes by before the app checks remote config again (60 minutes)
+        var expirationDuration: Double = 3600
+        // if developer mode, set expirationDuration to 0
+        if remoteConfig.configSettings.isDeveloperModeEnabled {
+            // Config immediately expires. Ready to receive a new one.
+            expirationDuration = 0
+            // this helps us test out configurations quickly
+        }
+        // fetch config
+        remoteConfig.fetch(withExpirationDuration: expirationDuration) { (status, error) in
+            if status == .success {
+                print("Config fetched")
+                self.remoteConfig.activateFetched()
+                let friendlyMsgLength = self.remoteConfig["friendly_message_length"]
+                if friendlyMsgLength.source != .static {
+                    self.msglength = friendlyMsgLength.numberValue!
+                    print("friend msg length config: \(self.msglength)")
+                }
+            } else {
+                print("config not fetched")
+                print("Error: \(error)")
+            }
+        }
     }
     
     // MARK: Sign In and Out
@@ -150,6 +173,8 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
             // Set up app to send and receive messages when signed in
             configureDatabase()
             configureStorage()
+            configureRemoteConfig()
+            fetchConfig()
         }
     }
     
