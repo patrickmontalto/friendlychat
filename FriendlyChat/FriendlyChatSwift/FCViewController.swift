@@ -17,6 +17,7 @@
 import UIKit
 import Firebase
 import FirebaseAuthUI
+import FirebaseGoogleAuthUI
 
 // MARK: - FCViewController
 
@@ -53,9 +54,9 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     // MARK: Life Cycle
     
     override func viewDidLoad() {
-        self.signedInStatus(isSignedIn: true)
-        
+        configureAuth()
         // TODO: Handle what users see when view loads
+        
     }
     
     override func viewWillDisappear(_ animated: Bool) {
@@ -66,19 +67,56 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     // MARK: Config
     
     func configureAuth() {
-        // TODO: configure firebase authentication
+        // Add google auth
+        let providers: [FUIAuthProvider] = [FUIGoogleAuth()]
+        FUIAuth.defaultAuthUI()?.providers = providers
+        
+        // listen for changes in authorization state
+        _authHandle = FIRAuth.auth()?.addStateDidChangeListener({ (auth, user) in
+            // refresh table data
+            self.messages.removeAll(keepingCapacity: false)
+            self.messagesTable.reloadData()
+            
+            // check if there is a current user in FIR
+            if let activeUser = user {
+                // check if the current app user is the current FIR user
+                if self.user != activeUser {
+                    self.user = activeUser
+                    self.signedInStatus(isSignedIn: true)
+                    let name = user!.email!.components(separatedBy: "@").first!
+                    self.displayName = name
+                }
+            } else {
+                // User needs to sign in
+                self.signedInStatus(isSignedIn: false)
+                self.loginSession()
+            }
+        })
     }
     
     func configureDatabase() {
-        // TODO: configure database to sync messages
+        // configure database to sync messages
+        ref = FIRDatabase.database().reference()
+        _refHandle = ref.child("messages").observe(.childAdded, with: { (snapshot) in
+            // Append to data array
+            self.messages.append(snapshot)
+            // Insert at last row
+            self.messagesTable.insertRows(at: [IndexPath(row: self.messages.count - 1, section: 0)], with: .automatic)
+            // Scroll to bottom
+            self.scrollToBottomMessage()
+        })
     }
     
     func configureStorage() {
-        // TODO: configure storage using your firebase storage
+        // configure storage using your firebase storage
+        storageRef = FIRStorage.storage().reference() //easy thanks to the google service info plist!
+        
     }
     
     deinit {
-        // TODO: set up what needs to be deinitialized when view is no longer being used
+        // remove obsever for changes
+        ref.child("messages").removeObserver(withHandle: _refHandle)
+        FIRAuth.auth()?.removeStateDidChangeListener(_authHandle)
     }
     
     // MARK: Remote Config
@@ -109,7 +147,9 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
             backgroundBlur.effect = nil
             messageTextField.delegate = self
             
-            // TODO: Set up app to send and receive messages when signed in
+            // Set up app to send and receive messages when signed in
+            configureDatabase()
+            configureStorage()
         }
     }
     
@@ -121,11 +161,32 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     // MARK: Send Message
     
     func sendMessage(data: [String:String]) {
-        // TODO: create method that pushes message to the firebase database
+        // pushes message to the firebase database
+        var mdata = data
+        mdata[Constants.MessageFields.name] = displayName
+        ref.child("messages").childByAutoId().setValue(mdata)
+        
     }
     
     func sendPhotoMessage(photoData: Data) {
-        // TODO: create method that pushes message w/ photo to the firebase database
+        // build a path using the user's ID and a timestamp
+        let imagePath = "chat_photos/" + FIRAuth.auth()!.currentUser!.uid + "/\(Double(Date.timeIntervalSinceReferenceDate * 1000)).jpg"
+        // set the content type to image/jpeg in firebase storage meta data
+        let metadata = FIRStorageMetadata()
+        metadata.contentType = "image/jpeg"
+        
+        // create a child node at imagePath with photoData and metadata
+        storageRef!.child(imagePath).put(photoData, metadata: metadata) { (metadata, error) in
+            if let error = error {
+                print("error uploading: \(error)")
+                return
+            }
+            
+            // use sendMessage to add imageURL to database
+            let data = [Constants.MessageFields.imageUrl: self.storageRef.child(metadata!.path!).description]
+            self.sendMessage(data: data)
+        }
+        
     }
     
     // MARK: Alert
@@ -201,8 +262,38 @@ extension FCViewController: UITableViewDelegate, UITableViewDataSource {
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         // dequeue cell
         let cell: UITableViewCell! = messagesTable.dequeueReusableCell(withIdentifier: "messageCell", for: indexPath)
+        let messageSnapshot = messages[indexPath.row]
+        let message = messageSnapshot.value as! [String:String]
+        let name = message[Constants.MessageFields.name] ?? "[username]"
+        
+        // if photo message, then grab the image and display it
+        if let imageUrl = message[Constants.MessageFields.imageUrl] {
+            cell.textLabel?.text = "sent by: \(name)"
+            // download and display image
+            FIRStorage.storage().reference(forURL: imageUrl).data(withMaxSize: INT64_MAX, completion: { (data, error) in
+                guard error == nil else {
+                    print("error downloading : \(error!)")
+                    return
+                }
+                
+                // display image
+                let messageImage = UIImage(data: data!, scale: 50)
+                // check if the cell is still on screen. if so, update cell image
+                if cell == tableView.cellForRow(at: indexPath) {
+                    DispatchQueue.main.async {
+                        cell.imageView?.image = messageImage
+                        cell.setNeedsLayout()
+                    }
+                }
+            })
+        } else {
+            // otherwise, update cell for regular message
+            let text = message[Constants.MessageFields.text] ?? "[message]"
+            cell.textLabel?.text = name + ": " + text
+            cell.imageView?.image = placeholderImage
+        }
+        
         return cell!
-        // TODO: update cell to display message data
     }
     
     func tableView(_ tableView: UITableView, estimatedHeightForRowAt indexPath: IndexPath) -> CGFloat {
@@ -211,6 +302,27 @@ extension FCViewController: UITableViewDelegate, UITableViewDataSource {
     
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
             // TODO: if message contains an image, then display the image
+        // skip if keyboard is shown
+        guard !messageTextField.isFirstResponder else { return }
+        
+        // unpack message from firebase data snapshot
+        let messageSnapshot = messages[indexPath.row]
+        let message = messageSnapshot.value as! [String: String]
+        
+        // if tapped row has image, then display image
+        if let imageUrl = message[Constants.MessageFields.imageUrl] {
+            if let cachedImage = imageCache.object(forKey: imageUrl as NSString) {
+                showImageDisplay(cachedImage)
+            } else {
+               FIRStorage.storage().reference(forURL: imageUrl).data(withMaxSize: INT64_MAX, completion: { (data, error) in
+                guard error == nil else {
+                    print("Error downloading: \(error!)")
+                    return
+                }
+                self.showImageDisplay(UIImage(data: data!)!)
+               })
+            }
+        }
     }
     
     // MARK: Show Image Display
